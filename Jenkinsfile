@@ -2035,23 +2035,24 @@ pipeline {
         sh "rm -rf examples/nlp/language_modeling/t5_pretrain_results"
       }
     }
-      stage('L2: Megatron T5 Eval') {
-      when {
-        anyOf {
-          branch 'main'
-          changeRequest target: 'main'
-        }
-      }
-      failFast true
-      steps{
-        sh "python examples/nlp/language_modeling/megatron_t5_eval.py \
-            --model_file \
-            /home/TestData/nlp/megatron_t5/220m/megatron_t5_220m.nemo \
-            --prompt \
-            'How do I fix my GPU memory issue? I am seeing <mask> out of memory.' \
-            --tensor_model_parallel_size 1"
-      }
-    }
+    // TODO: update test after refactor PR is merged
+    //   stage('L2: Megatron T5 Eval') {
+    //   when {
+    //     anyOf {
+    //       branch 'main'
+    //       changeRequest target: 'main'
+    //     }
+    //   }
+    //   failFast true
+    //   steps{
+    //     sh "python examples/nlp/language_modeling/megatron_t5_eval.py \
+    //         --model_file \
+    //         /home/TestData/nlp/megatron_t5/220m/megatron_t5_220m.nemo \
+    //         --prompt \
+    //         'How do I fix my GPU memory issue? I am seeing <mask> out of memory.' \
+    //         --tensor_model_parallel_size 1"
+    //   }
+    // }
     stage('L2: TTS Fast dev runs 1') {
       when {
         anyOf {
