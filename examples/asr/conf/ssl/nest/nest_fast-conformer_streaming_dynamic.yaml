@@ -1,0 +1,248 @@
+# Streaming NEST with Dynamic Context Size
+# Trains with multiple context sizes for flexible deployment
+#
+# This model can be deployed with ANY of the trained context sizes:
+# - [80, 0]:  ~0.8s context, ~20ms latency
+# - [160, 0]: ~1.6s context, ~40ms latency
+# - [240, 0]: ~2.4s context, ~60ms latency
+# - [320, 0]: ~3.2s context, ~80ms latency
+# - [-1, 0]:  Unlimited context, best accuracy
+
+name: "SSL-NEST-FastConformer-DynamicStreaming"
+
+model:
+  sample_rate: 16000
+  num_classes: 8192
+  num_books: 1
+  code_dim: 16
+  squeeze_single: false
+  mask_position: pre_conv
+
+  train_ds:
+    manifest_filepath: ???
+    noise_manifest: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: true
+    num_workers: 8
+    pin_memory: true
+    use_start_end_token: false
+    trim_silence: false
+    max_duration: 60.0
+    min_duration: 1.0
+    drop_last: true
+    is_concat: false
+    concat_sampling_technique: temperature
+    concat_sampling_temperature: 1.0
+    is_tarred: false
+    tarred_audio_filepaths: null
+    shuffle_n: 2048
+    bucketing_strategy: "synced_randomized"
+    bucketing_batch_size: null
+    batch_augmentor:
+      _target_: nemo.collections.asr.modules.ssl_modules.MultiSpeakerNoiseAugmentation
+      prob: 0.5
+      noise_ratio: 0.5
+      min_r_speech: -5.0
+      max_r_speech: 5.0
+      min_r_noise: -5.0
+      max_r_noise: 20.0
+      min_mix_rate: 0.5
+      max_mix_rate: 0.5
+      min_num_segments: 1
+      max_num_segments: 1
+      min_num_speakers: 1
+      max_num_speakers: 1
+
+  validation_ds:
+    manifest_filepath: ???
+    noise_manifest: null
+    sample_rate: ${model.sample_rate}
+    batch_size: 8
+    shuffle: false
+    num_workers: 8
+    pin_memory: true
+    use_start_end_token: false
+    max_duration: 60.0
+    min_duration: 1.0
+    batch_augmentor:
+      _target_: nemo.collections.asr.modules.ssl_modules.MultiSpeakerNoiseAugmentation
+      prob: 0.5
+      noise_ratio: 0.5
+      min_r_speech: -5.0
+      max_r_speech: 5.0
+      min_r_noise: -5.0
+      max_r_noise: 20.0
+      min_mix_rate: 0.5
+      max_mix_rate: 0.5
+      min_num_segments: 1
+      max_num_segments: 1
+      min_num_speakers: 1
+      max_num_speakers: 1
+
+  preprocessor:
+    _target_: nemo.collections.asr.modules.AudioToMelSpectrogramPreprocessor
+    sample_rate: ${model.sample_rate}
+    normalize: "per_feature"
+    window_size: 0.025
+    window_stride: 0.01
+    window: "hann"
+    features: 80
+    n_fft: 512
+    log: true
+    frame_splicing: 1
+    dither: 0.00001
+    pad_to: 16
+    pad_value: 0.0
+
+  spec_augment:
+    _target_: nemo.collections.asr.modules.SpectrogramAugmentation
+    freq_masks: 0
+    time_masks: 0
+    freq_width: 27
+    time_width: 0.05
+
+  masking:
+    _target_: nemo.collections.asr.modules.RandomBlockMasking
+    block_size: 40
+    mask_prob: 0.01
+    feat_in: ${model.preprocessor.features}
+    freeze: true
+    allow_overlap: true
+    causal: true
+    left_context_size: -1
+
+  quantizer:
+    _target_: nemo.collections.asr.modules.RandomProjectionVectorQuantizer
+    feat_in: ${model.preprocessor.features}
+    code_dim: ${model.code_dim}
+    num_books: ${model.num_books}
+    num_classes: ${model.num_classes}
+    dist_fn: "l2"
+    freeze: true
+    squeeze_single: ${model.squeeze_single}
+    combine_time_steps: ${model.encoder.subsampling_factor}
+
+  encoder:
+    _target_: nemo.collections.asr.modules.ConformerEncoder
+    feat_in: ${model.preprocessor.features}
+    feat_out: -1
+    n_layers: 17
+    d_model: 512
+    use_bias: True
+
+    # Sub-sampling
+    subsampling: dw_striding
+    subsampling_factor: 8
+    subsampling_conv_channels: 256
+    causal_downsampling: true
+
+    # Feed forward
+    ff_expansion_factor: 4
+
+    # DYNAMIC CONTEXT: Multiple context sizes for flexible deployment
+    # Model will be trained to work with ALL of these contexts
+    self_attention_model: rel_pos
+    n_heads: 8
+
+    att_context_size: [
+      [80, 0],      # Very low latency: ~0.8s context, ~20-30ms latency
+      [160, 0],     # Low latency:      ~1.6s context, ~40-50ms latency
+      [240, 0],     # Medium latency:   ~2.4s context, ~60-70ms latency
+      [320, 0],     # Standard:         ~3.2s context, ~80-100ms latency
+      [-1, 0],      # Unlimited:        Best accuracy, higher latency
+    ]
+
+    # Sampling probabilities: Focus on practical ranges
+    # Adjust these based on your target deployment scenarios
+    att_context_probs: [
+      0.15,   # 15% very low latency
+      0.25,   # 25% low latency
+      0.30,   # 30% medium latency (most common)
+      0.25,   # 25% standard
+      0.05,   # 5% unlimited (for comparison)
+    ]
+
+    att_context_style: regular
+    xscaling: true
+    untie_biases: true
+    pos_emb_max_len: 5000
+
+    # Convolution (causal for streaming)
+    conv_kernel_size: 9
+    conv_norm_type: 'layer_norm'  # CRITICAL: Use layer_norm for streaming
+    conv_context_size: causal
+
+    # Regularization
+    dropout: 0.1
+    dropout_pre_encoder: 0.1
+    dropout_emb: 0.0
+    dropout_att: 0.1
+    stochastic_depth_drop_prob: 0.0
+    stochastic_depth_mode: linear
+    stochastic_depth_start_layer: 1
+
+  decoder:
+    _target_: nemo.collections.asr.modules.MultiSoftmaxDecoder
+    feat_in: ${model.encoder.d_model}
+    num_classes: ${model.num_classes}
+    num_decoders: ${model.num_books}
+    squeeze_single: ${model.squeeze_single}
+    use_bias: true
+
+  loss:
+    _target_: nemo.collections.asr.losses.MultiMLMLoss
+    combine_time_steps: ${model.encoder.subsampling_factor}
+    mask_threshold: 0.8
+    num_decoders: ${model.num_books}
+    squeeze_single: ${model.squeeze_single}
+
+  optim:
+    name: adamw
+    lr: 5.0
+    betas: [0.9, 0.98]
+    weight_decay: 1e-3
+    sched:
+      name: NoamAnnealing
+      d_model: ${model.encoder.d_model}
+      warmup_steps: 25000
+      warmup_ratio: null
+      min_lr: 1e-6
+
+trainer:
+  devices: -1
+  num_nodes: 1
+  max_epochs: -1
+  max_steps: 500000
+  val_check_interval: 2500
+  accelerator: auto
+  strategy: ddp
+  accumulate_grad_batches: 1
+  gradient_clip_val: 0.0
+  precision: 32
+  log_every_n_steps: 10
+  enable_progress_bar: True
+  num_sanity_val_steps: 0
+  check_val_every_n_epoch: 1
+  sync_batchnorm: true
+  enable_checkpointing: False
+  logger: false
+  benchmark: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: true
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: "val_loss"
+    mode: "min"
+    save_top_k: 1
+    always_save_nemo: True
+    filename: '${name}--{${exp_manager.checkpoint_callback_params.monitor}:.3f}-{step}'
+  resume_if_exists: true
+  resume_ignore_no_checkpoint: true
+  create_wandb_logger: false
+  wandb_logger_kwargs:
+    name: null
+    project: null
