@@ -1002,8 +1002,18 @@ class EncDecDenoiseMaskedTokenPredModel(EncDecMaskedTokenPredModel):
         else:
             _, tokens = self.quantizer(input_signal=processed_signal)
             if apply_mask:
+                # Get encoder's attention context size for syncing with masking
+                effective_left_context = None
+                if hasattr(self.encoder, 'att_context_size'):
+                    att_context = self.encoder.att_context_size
+                    if isinstance(att_context, (list, tuple)) and len(att_context) >= 1:
+                        effective_left_context = att_context[0] if att_context[0] != -1 else None
+
                 masked_signal, masks = self.mask_processor(
-                    input_feats=processed_noisy_input_signal, input_lengths=processed_noisy_input_signal_length
+                    input_feats=processed_noisy_input_signal,
+                    input_lengths=processed_noisy_input_signal_length,
+                    current_frame=None,  # Set to appropriate value for streaming inference
+                    effective_left_context=effective_left_context
                 )
             else:
                 masked_signal = processed_noisy_input_signal

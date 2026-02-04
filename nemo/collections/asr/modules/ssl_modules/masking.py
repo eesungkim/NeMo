@@ -253,10 +253,15 @@ class RandomBlockMasking(NeuralModule):
                     patch_indices = torch.randperm(count, device=device)[:num_patches] + min_mask_pos
                 else:
                     # Non-overlapping blocks
-                    num_patches = torch.ceil(torch.tensor(available_length * self.mask_prob / self.block_size, device=device)).int()
                     max_num_patches = torch.div(torch.tensor(available_length, device=device), block_size, rounding_mode='trunc')
-                    if max_num_patches > 0:
-                        patch_indices = torch.randperm(max_num_patches.item(), device=device)[:num_patches]
+                    max_num_patches_int = max(0, int(max_num_patches.item()))
+
+                    # Calculate desired number of patches and cap to max available
+                    desired_patches = int(torch.ceil(torch.tensor(available_length * self.mask_prob / self.block_size, device=device)).item())
+                    num_patches = min(desired_patches, max_num_patches_int)
+
+                    if num_patches > 0:
+                        patch_indices = torch.randperm(max_num_patches_int, device=device)[:num_patches]
                         patch_indices = patch_indices * block_size + min_mask_pos
                     else:
                         num_patches = 0
@@ -264,8 +269,8 @@ class RandomBlockMasking(NeuralModule):
             if num_patches > 0:
                 # Ensure blocks don't extend beyond max_mask_pos
                 ends = torch.clamp(patch_indices + block_size, max=max_mask_pos)
-                positions = torch.cat([torch.arange(s, e) for s, e in zip(patch_indices, ends)]).reshape(-1, 1)
-                batch_index = torch.full((positions.shape[0], 1), i, dtype=positions.dtype)
+                positions = torch.cat([torch.arange(s, e, device=device) for s, e in zip(patch_indices, ends)]).reshape(-1, 1)
+                batch_index = torch.full((positions.shape[0], 1), i, dtype=positions.dtype, device=device)
                 positions = torch.cat([batch_index, positions], dim=1)
                 indices.append(positions.unique(dim=0))
 
@@ -274,8 +279,13 @@ class RandomBlockMasking(NeuralModule):
             masks = masks.permute(0, 2, 1)
             masked_feats = masked_feats.permute(0, 2, 1)
 
-            masks = masks.index_put(indices, values=torch.tensor(1.0)).permute(0, 2, 1)
-            masked_feats = masked_feats.index_put(indices, values=self.mask_embedding).permute(0, 2, 1)
+            # Ensure mask value has correct device and dtype
+            mask_value = torch.tensor(1.0, device=device, dtype=masks.dtype)
+            # Ensure mask_embedding is on correct device
+            mask_embedding = self.mask_embedding.to(device=device, dtype=masked_feats.dtype)
+
+            masks = masks.index_put(indices, values=mask_value).permute(0, 2, 1)
+            masked_feats = masked_feats.index_put(indices, values=mask_embedding).permute(0, 2, 1)
 
         return masked_feats, masks
 

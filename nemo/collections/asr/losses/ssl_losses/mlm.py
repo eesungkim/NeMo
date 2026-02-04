@@ -71,6 +71,18 @@ class MLMLoss(Loss):
         masks = masks.reshape(masks.shape[0], masks.shape[1] // self.combine_time_steps, -1)
         masks = masks.mean(-1) > self.mask_threshold
 
+        # Ensure decoder_outputs matches mask time dimension
+        if decoder_outputs.shape[1] != masks.shape[1]:
+            if decoder_outputs.shape[1] > masks.shape[1]:
+                # Trim decoder_outputs to match mask length
+                decoder_outputs = decoder_outputs[:, :masks.shape[1], :]
+            else:
+                # Pad decoder_outputs to match mask length
+                pad_length = masks.shape[1] - decoder_outputs.shape[1]
+                decoder_outputs = F.pad(decoder_outputs, (0, 0, 0, pad_length))
+                # Pad masks with False so padded decoder positions aren't selected
+                masks = F.pad(masks.float(), (0, pad_length), value=0.0).bool()
+
         out_masked_only = decoder_outputs[masks]
         targets = F.pad(targets, (0, masks.shape[-1] - targets.shape[-1]))
         targets_masked_only = targets[masks]

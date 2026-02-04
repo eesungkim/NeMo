@@ -78,8 +78,20 @@ def setup_hierarchical_context(model, schedule):
     for i, (layer, context) in enumerate(zip(encoder.layers, contexts)):
         if hasattr(layer, 'self_attention'):
             if hasattr(layer.self_attention, 'att_context_size'):
+                # Validate context values
+                if isinstance(context, (list, tuple)) and len(context) >= 1:
+                    left_context = context[0]
+                    if left_context < -1:
+                        raise ValueError(f"Invalid left context {left_context} for layer {i}. Must be >= -1.")
+                    if left_context == 0:
+                        logging.warning(f"Layer {i} has left_context=0, which may cause issues in streaming mode.")
+
                 layer.self_attention.att_context_size = context
                 logging.info(f"  Layer {i:2d}: context = {context}")
+            else:
+                logging.warning(f"Layer {i} does not have att_context_size attribute. Skipping.")
+        else:
+            logging.warning(f"Layer {i} does not have self_attention attribute. Skipping.")
 
     return contexts
 
@@ -108,9 +120,21 @@ def setup_curriculum_context(model, start_context, end_context, warmup_steps):
         # Update encoder context
         pl_module.encoder.att_context_size = [context, 0]
 
-        # Sync masking
+        # Sync masking with minimum context to avoid information leakage
+        # In hierarchical mode, different layers may have different contexts
+        # Masking should use the MINIMUM (tightest) context to ensure no leakage
         if hasattr(pl_module, 'mask_processor'):
-            pl_module.mask_processor.left_context_size = context
+            min_context = context
+            # Check if hierarchical contexts are set
+            if hasattr(pl_module.encoder, 'layers'):
+                for layer in pl_module.encoder.layers:
+                    if hasattr(layer, 'self_attention') and hasattr(layer.self_attention, 'att_context_size'):
+                        layer_context = layer.self_attention.att_context_size
+                        if isinstance(layer_context, (list, tuple)) and len(layer_context) >= 1:
+                            if layer_context[0] > 0:  # Ignore unlimited context (-1)
+                                min_context = min(min_context, layer_context[0])
+
+            pl_module.mask_processor.left_context_size = min_context
 
         if step % 1000 == 0:
             logging.info(f"Step {step}: Context size = {context}")
@@ -147,12 +171,20 @@ def main(cfg):
         # Convert OmegaConf to list of tuples
         if isinstance(schedule, (list, tuple)):
             schedule_parsed = []
-            for item in schedule:
+            for idx, item in enumerate(schedule):
                 if isinstance(item, (list, tuple)) and len(item) == 2:
                     layer_idx, context = item
+                    # Validate layer_idx and context
+                    if not isinstance(layer_idx, int) or layer_idx < 0:
+                        raise ValueError(f"Invalid layer_idx in schedule item {idx}: {layer_idx}. Must be non-negative integer.")
+                    if not isinstance(context, (list, tuple)) or len(context) < 1:
+                        raise ValueError(f"Invalid context in schedule item {idx}: {context}. Must be list/tuple with at least 1 element.")
                     schedule_parsed.append((layer_idx, context))
                 else:
-                    logging.warning(f"Invalid schedule item: {item}")
+                    raise ValueError(f"Invalid schedule item at index {idx}: {item}. Expected [layer_idx, context] format.")
+
+            if not schedule_parsed:
+                raise ValueError("Schedule is empty after parsing. At least one schedule point is required.")
 
             logging.info("=" * 70)
             logging.info("ADVANCED FEATURE: Hierarchical Multi-Scale Context")
