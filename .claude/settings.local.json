@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "WebSearch",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:paperreading.club)",
+      "Bash(gh api:*)",
+      "WebFetch(domain:raw.githubusercontent.com)"
     ]
   }
 }

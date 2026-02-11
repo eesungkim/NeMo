@@ -44,6 +44,7 @@ import torch.nn.functional as F
 from nemo.utils import avoid_float16_autocast_context
 
 __all__ = [
+    'MALAMultiHeadAttention',
     'RelPositionMultiHeadAttention',
     'RelPositionalEncoding',
     'PositionalEncoding',
@@ -207,6 +208,219 @@ class MultiHeadAttention(nn.Module):
             q_keep_size = query.shape[1] - self.cache_drop_size
             cache = torch.cat([cache[:, q_keep_size:, :], query[:, :q_keep_size, :]], dim=1)
         return key, value, query, cache
+
+
+class MALAMultiHeadAttention(MultiHeadAttention):
+    """Magnitude-Aware Linear Attention (MALA) with LePE for positional information.
+
+    This module supports:
+    - Full-sequence MALA attention (no cache)
+    - Recurrent fixed-size streaming cache (packed into a tensor to match Conformer cache API)
+    """
+
+    def __init__(
+        self,
+        n_head,
+        n_feat,
+        dropout_rate,
+        max_cache_len=0,
+        use_bias=True,
+        lepe_kernel_size=5,
+        eps=1e-6,
+    ):
+        super().__init__(
+            n_head=n_head,
+            n_feat=n_feat,
+            dropout_rate=dropout_rate,
+            max_cache_len=max_cache_len,
+            use_bias=use_bias,
+            use_pytorch_sdpa=False,
+            use_pytorch_sdpa_backends=None,
+        )
+        self.elu = nn.ELU()
+        self.lepe = nn.Conv1d(
+            n_feat,
+            n_feat,
+            kernel_size=lepe_kernel_size,
+            padding=lepe_kernel_size // 2,
+            groups=n_feat,
+            bias=use_bias,
+        )
+        self.eps = eps
+        # Packed cache layout rows: [kv_state(d_k rows), k_sum, v_sum, n]
+        self.recurrent_cache_size = self.d_k + 3
+
+    def phi(self, x: torch.Tensor) -> torch.Tensor:
+        return self.elu(x) + 1.0
+
+    def _init_recurrent_state(self, batch_size: int, device: torch.device, dtype: torch.dtype):
+        kv_state = torch.zeros(batch_size, self.h, self.d_k, self.d_k, device=device, dtype=dtype)
+        k_sum = torch.zeros(batch_size, self.h, self.d_k, device=device, dtype=dtype)
+        v_sum = torch.zeros(batch_size, self.h, self.d_k, device=device, dtype=dtype)
+        n = torch.zeros(batch_size, device=device, dtype=dtype)
+        return kv_state, k_sum, v_sum, n
+
+    def _pack_recurrent_state(self, kv_state, k_sum, v_sum, n):
+        bsz = kv_state.size(0)
+        d_model = self.h * self.d_k
+
+        kv_rows = kv_state.permute(0, 2, 1, 3).reshape(bsz, self.d_k, d_model)
+        k_sum_row = k_sum.reshape(bsz, 1, d_model)
+        v_sum_row = v_sum.reshape(bsz, 1, d_model)
+        n_row = kv_rows.new_zeros((bsz, 1, d_model))
+        n_row[:, 0, 0] = n
+
+        return torch.cat([kv_rows, k_sum_row, v_sum_row, n_row], dim=1)
+
+    def _unpack_recurrent_state(self, cache, batch_size: int, device: torch.device, dtype: torch.dtype):
+        if cache is None:
+            return self._init_recurrent_state(batch_size=batch_size, device=device, dtype=dtype)
+
+        d_model = self.h * self.d_k
+        if cache.size(1) != self.recurrent_cache_size or cache.size(2) != d_model:
+            return self._init_recurrent_state(batch_size=batch_size, device=device, dtype=dtype)
+
+        cache = cache.to(dtype=dtype)
+        kv_rows = cache[:, : self.d_k, :]  # (B, d_k, D)
+        kv_state = kv_rows.reshape(batch_size, self.d_k, self.h, self.d_k).permute(0, 2, 1, 3).contiguous()
+        k_sum = cache[:, self.d_k, :].reshape(batch_size, self.h, self.d_k).contiguous()
+        v_sum = cache[:, self.d_k + 1, :].reshape(batch_size, self.h, self.d_k).contiguous()
+        n = cache[:, self.d_k + 2, 0].contiguous().clamp(min=0.0)
+        return kv_state, k_sum, v_sum, n
+
+    def _mala_from_global_state(self, q, kv_state, k_sum, v_sum, n):
+        qk = (q * k_sum.unsqueeze(-2)).sum(dim=-1)
+        beta = 1.0 + 1.0 / (qk + self.eps)
+
+        n = n.clamp(min=1.0)
+        n_expanded = n.view(-1, 1, 1)
+        z = qk / n_expanded
+        v_mean = v_sum / n_expanded
+
+        out = torch.einsum('bhtd,bhde->bhte', q, kv_state)
+        out = out * beta.unsqueeze(-1) - z.unsqueeze(-1) * v_mean.unsqueeze(-2)
+        return out
+
+    def _extract_masks(self, mask):
+        if mask is None:
+            return None, None, None
+        mask = mask.to(dtype=torch.bool)
+        valid = ~mask
+        query_valid = valid.any(dim=-1)
+        key_valid = valid.any(dim=1)
+        return valid, query_valid, key_valid
+
+    def _is_prefix_causal_mask(self, mask, query_valid, key_valid):
+        if mask is None or mask.size(-1) != mask.size(-2):
+            return False
+
+        t = mask.size(-1)
+        upper = torch.triu(torch.ones((t, t), dtype=torch.bool, device=mask.device), diagonal=1)
+        # Any visible future position means non-causal.
+        if (~mask)[..., upper].any().item():
+            return False
+
+        lower = torch.tril(torch.ones((t, t), dtype=torch.bool, device=mask.device), diagonal=0)
+        valid_pairs = query_valid.unsqueeze(-1) & key_valid.unsqueeze(-2)
+        # For pure prefix-causal masks, only padded regions can be masked on/under the diagonal.
+        unexpected_masked = mask & lower.unsqueeze(0) & valid_pairs
+        return not unexpected_masked.any().item()
+
+    def _mala_full_context(self, q, k, v):
+        kv_state = torch.einsum('bhtd,bhte->bhde', k, v)
+        k_sum = k.sum(dim=-2)
+        v_sum = v.sum(dim=-2)
+        n = q.new_full((q.size(0),), k.size(-2))
+        return self._mala_from_global_state(q=q, kv_state=kv_state, k_sum=k_sum, v_sum=v_sum, n=n)
+
+    def _mala_prefix_causal(self, q, k, v, query_valid, key_valid):
+        kv_tokens = torch.einsum('bhtd,bhte->bhtde', k, v)
+        kv_state = torch.cumsum(kv_tokens, dim=2)
+        k_sum = torch.cumsum(k, dim=2)
+        v_sum = torch.cumsum(v, dim=2)
+        n = torch.cumsum(key_valid.to(dtype=q.dtype), dim=-1).clamp(min=1.0)
+
+        qk = (q * k_sum).sum(dim=-1)
+        beta = 1.0 + 1.0 / (qk + self.eps)
+        z = qk / n.unsqueeze(1)
+        v_mean = v_sum / n.unsqueeze(1).unsqueeze(-1)
+
+        out = torch.einsum('bhtd,bhtde->bhte', q, kv_state)
+        out = out * beta.unsqueeze(-1) - z.unsqueeze(-1) * v_mean
+        out = out * query_valid.unsqueeze(1).unsqueeze(-1).to(dtype=out.dtype)
+        return out
+
+    def _mala_masked(self, q, k, v, valid):
+        valid_float = valid.to(dtype=q.dtype)
+        kv_tokens = torch.einsum('bhkd,bhke->bhkde', k, v)
+        kv_state = torch.einsum('bqk,bhkde->bhqde', valid_float, kv_tokens)
+        k_sum = torch.einsum('bqk,bhkd->bhqd', valid_float, k)
+        v_sum = torch.einsum('bqk,bhkd->bhqd', valid_float, v)
+        n = valid_float.sum(dim=-1).clamp(min=1.0)
+
+        qk = (q * k_sum).sum(dim=-1)
+        beta = 1.0 + 1.0 / (qk + self.eps)
+        z = qk / n.unsqueeze(1)
+        v_mean = v_sum / n.unsqueeze(1).unsqueeze(-1)
+
+        out = torch.einsum('bhqd,bhqde->bhqe', q, kv_state)
+        out = out * beta.unsqueeze(-1) - z.unsqueeze(-1) * v_mean
+
+        query_valid = valid.any(dim=-1)
+        out = out * query_valid.unsqueeze(1).unsqueeze(-1).to(dtype=out.dtype)
+        return out
+
+    def forward(self, query, key, value, mask, pos_emb=None, cache=None):
+        if torch.is_autocast_enabled():
+            query, key, value = query.to(torch.float32), key.to(torch.float32), value.to(torch.float32)
+
+        with avoid_float16_autocast_context():
+            q, k, v = self.forward_qkv(query, key, value)
+            q = self.phi(q)
+            k = self.phi(k)
+
+            valid, query_valid, key_valid = self._extract_masks(mask)
+
+            if key_valid is not None:
+                kv_mask = key_valid.unsqueeze(1).unsqueeze(-1).to(dtype=k.dtype)
+                k = k * kv_mask
+                v = v * kv_mask
+
+            if cache is not None:
+                kv_state, k_sum, v_sum, n = self._unpack_recurrent_state(
+                    cache=cache, batch_size=q.size(0), device=q.device, dtype=q.dtype
+                )
+                kv_state = kv_state + torch.einsum('bhtd,bhte->bhde', k, v)
+                k_sum = k_sum + k.sum(dim=-2)
+                v_sum = v_sum + v.sum(dim=-2)
+
+                if key_valid is None:
+                    n = n + q.new_full((q.size(0),), k.size(-2))
+                else:
+                    n = n + key_valid.to(dtype=q.dtype).sum(dim=-1)
+
+                out = self._mala_from_global_state(q=q, kv_state=kv_state, k_sum=k_sum, v_sum=v_sum, n=n)
+                if query_valid is not None:
+                    out = out * query_valid.unsqueeze(1).unsqueeze(-1).to(dtype=out.dtype)
+
+                cache = self._pack_recurrent_state(kv_state=kv_state, k_sum=k_sum, v_sum=v_sum, n=n)
+            else:
+                if valid is None:
+                    out = self._mala_full_context(q=q, k=k, v=v)
+                elif self._is_prefix_causal_mask(mask=mask, query_valid=query_valid, key_valid=key_valid):
+                    out = self._mala_prefix_causal(q=q, k=k, v=v, query_valid=query_valid, key_valid=key_valid)
+                else:
+                    out = self._mala_masked(q=q, k=k, v=v, valid=valid)
+
+            n_batch = query.size(0)
+            out = out.transpose(1, 2).reshape(n_batch, -1, self.h * self.d_k)
+            lepe_out = self.lepe(value.transpose(1, 2)).transpose(1, 2)
+            out = self.linear_out(out + lepe_out)
+
+        if cache is None:
+            return out
+        else:
+            return out, cache
 
 
 class RelPositionMultiHeadAttention(MultiHeadAttention):

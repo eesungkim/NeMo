@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from nemo.collections.asr.modules.conformer_encoder import ConformerEncoder
+from nemo.collections.asr.parts.submodules.multi_head_attention import MALAMultiHeadAttention
 
 
 class TestStochasticDepth:
@@ -222,3 +223,102 @@ class TestBypassPreEncode:
         model.eval()
         fwd_outputs = model(audio_signal=feat_input, length=input_length, bypass_pre_encode=False)[0]
         assert fwd_outputs.shape == (batch_size, feat_out, sub_sampled_n_frames)
+
+
+class TestMALA:
+    def test_mala_attention_streaming_matches_full_causal(self):
+        torch.manual_seed(0)
+        batch_size, time, dim, n_head, chunk = 2, 24, 16, 4, 6
+
+        attn = MALAMultiHeadAttention(
+            n_head=n_head, n_feat=dim, dropout_rate=0.0, use_bias=True, lepe_kernel_size=1
+        ).eval()
+
+        x = torch.randn(batch_size, time, dim)
+        full_mask = torch.triu(torch.ones(time, time, dtype=torch.bool), diagonal=1).unsqueeze(0).expand(
+            batch_size, -1, -1
+        )
+
+        with torch.no_grad():
+            full_out = attn(query=x, key=x, value=x, mask=full_mask)
+
+            cache = torch.zeros(batch_size, attn.recurrent_cache_size, dim, dtype=x.dtype, device=x.device)
+            stream_out = []
+            for start in range(0, time, chunk):
+                end = min(start + chunk, time)
+                x_chunk = x[:, start:end, :]
+                t_chunk = end - start
+                chunk_mask = torch.triu(torch.ones(t_chunk, t_chunk, dtype=torch.bool), diagonal=1).unsqueeze(0)
+                chunk_mask = chunk_mask.expand(batch_size, -1, -1)
+                y_chunk, cache = attn(query=x_chunk, key=x_chunk, value=x_chunk, mask=chunk_mask, cache=cache)
+                stream_out.append(y_chunk)
+
+            stream_out = torch.cat(stream_out, dim=1)
+
+        torch.testing.assert_close(stream_out, full_out, rtol=1e-4, atol=1e-4)
+
+    def test_mala_conformer_encoder_forward_shape(self):
+        model = ConformerEncoder(
+            feat_in=80,
+            n_layers=4,
+            d_model=256,
+            self_attention_model='mala',
+            n_heads=4,
+            subsampling=None,
+            dropout=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            dropout_att=0.0,
+            conv_kernel_size=3,
+            conv_norm_type='layer_norm',
+        ).eval()
+
+        audio_signal = torch.randn(2, 80, 100)
+        length = torch.tensor([100, 80], dtype=torch.int64)
+
+        with torch.no_grad():
+            out, out_len = model(audio_signal=audio_signal, length=length)
+
+        assert out.shape == (2, 256, 100)
+        torch.testing.assert_close(out_len, length)
+
+    def test_mala_conformer_encoder_streaming_forward(self):
+        model = ConformerEncoder(
+            feat_in=80,
+            n_layers=2,
+            d_model=32,
+            self_attention_model='mala',
+            n_heads=4,
+            subsampling=None,
+            att_context_size=[-1, 0],
+            dropout=0.0,
+            dropout_pre_encoder=0.0,
+            dropout_emb=0.0,
+            dropout_att=0.0,
+            conv_kernel_size=1,
+            conv_norm_type='layer_norm',
+        ).eval()
+
+        audio_signal = torch.randn(1, 80, 20)
+        length = torch.tensor([20], dtype=torch.int64)
+        cache_last_channel, cache_last_time, cache_last_channel_len = model.get_initial_cache_state(
+            batch_size=1, dtype=audio_signal.dtype, device=audio_signal.device
+        )
+
+        with torch.no_grad():
+            out, out_len, cache_last_channel_next, cache_last_time_next, cache_last_channel_next_len = model(
+                audio_signal=audio_signal,
+                length=length,
+                cache_last_channel=cache_last_channel,
+                cache_last_time=cache_last_time,
+                cache_last_channel_len=cache_last_channel_len,
+            )
+
+        assert out.shape == (1, 32, 20)
+        torch.testing.assert_close(out_len, length)
+        assert cache_last_channel_next.shape[2] == model.streaming_cfg.last_channel_cache_size
+        assert cache_last_time_next.shape[0] == len(model.layers)
+        torch.testing.assert_close(
+            cache_last_channel_next_len,
+            torch.full_like(cache_last_channel_next_len, model.streaming_cfg.last_channel_cache_size),
+        )

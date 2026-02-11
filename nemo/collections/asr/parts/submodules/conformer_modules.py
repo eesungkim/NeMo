@@ -21,6 +21,7 @@ from nemo.collections.asr.parts.submodules.adapters.attention_adapter_mixin impo
 from nemo.collections.asr.parts.submodules.batchnorm import FusedBatchNorm1d
 from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
+    MALAMultiHeadAttention,
     MultiHeadAttention,
     RelPositionMultiHeadAttention,
     RelPositionMultiHeadAttentionLongformer,
@@ -43,6 +44,7 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
             'rel_pos_local_attn': relative positional embedding and Transformer-XL with local attention using
                 overlapping chunks. Attention context is determined by att_context_size parameter.
             'abs_pos': absolute positional embedding and Transformer
+            'mala': magnitude-aware linear attention with LePE positional encoding
             Default is rel_pos.
         global_tokens (int): number of tokens to be used for global attention.
             Only relevant if self_attention_model is 'rel_pos_local_attn'.
@@ -144,10 +146,18 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
                 use_pytorch_sdpa=self.use_pytorch_sdpa,
                 use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
             )
+        elif self_attention_model == 'mala':
+            self.self_attn = MALAMultiHeadAttention(
+                n_head=n_heads,
+                n_feat=d_model,
+                dropout_rate=dropout_att,
+                max_cache_len=MHA_max_cache_len,
+                use_bias=use_bias,
+            )
         else:
             raise ValueError(
                 f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
-                f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos']"
+                f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos', 'mala']"
             )
 
         # second feed forward module
@@ -182,6 +192,8 @@ class ConformerLayer(torch.nn.Module, AttentionAdapterModuleMixin, AccessMixin):
         elif self.self_attention_model == 'rel_pos_local_attn':
             x = self.self_attn(query=x, key=x, value=x, pad_mask=pad_mask, pos_emb=pos_emb, cache=cache_last_channel)
         elif self.self_attention_model == 'abs_pos':
+            x = self.self_attn(query=x, key=x, value=x, mask=att_mask, cache=cache_last_channel)
+        elif self.self_attention_model == 'mala':
             x = self.self_attn(query=x, key=x, value=x, mask=att_mask, cache=cache_last_channel)
         else:
             x = None

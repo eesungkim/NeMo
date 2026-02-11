@@ -29,6 +29,7 @@ from nemo.collections.asr.parts.submodules.causal_convs import CausalConv1D
 from nemo.collections.asr.parts.submodules.conformer_modules import ConformerLayer
 from nemo.collections.asr.parts.submodules.multi_head_attention import (
     LocalAttRelPositionalEncoding,
+    MALAMultiHeadAttention,
     MultiHeadAttention,
     PositionalEncoding,
     RelPositionalEncoding,
@@ -98,6 +99,8 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 overlapping chunks. Attention context is determined by att_context_size parameter.
             'abs_pos':
                 absolute positional embedding and Transformer
+            'mala':
+                magnitude-aware linear attention with LePE positional encoding
 
             Default is rel_pos.
         pos_emb_max_len (int): the maximum length of positional embeddings
@@ -331,6 +334,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         d_ff = d_model * ff_expansion_factor
         self.d_model = d_model
         self.n_layers = n_layers
+        self.n_heads = n_heads
         self._feat_in = feat_in
         self.att_context_style = att_context_style
         self.subsampling_factor = subsampling_factor
@@ -439,6 +443,12 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 dropout_rate_emb=dropout_emb,
             )
         elif self_attention_model == "abs_pos":
+            pos_bias_u = None
+            pos_bias_v = None
+            self.pos_enc = PositionalEncoding(
+                d_model=d_model, dropout_rate=dropout_pre_encoder, max_len=pos_emb_max_len, xscale=self.xscale
+            )
+        elif self_attention_model == "mala":
             pos_bias_u = None
             pos_bias_v = None
             self.pos_enc = PositionalEncoding(
@@ -642,15 +652,22 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
         max_audio_length = audio_signal.size(1)
         if cache_last_channel is not None:
-            cache_len = self.streaming_cfg.last_channel_cache_size
-            cache_keep_size = max_audio_length - self.streaming_cfg.cache_drop_size
-            max_audio_length = max_audio_length + cache_len
-            padding_length = length + cache_len
-            offset = torch.neg(cache_last_channel_len) + cache_len
+            if self.self_attention_model == "mala":
+                cache_len = 0
+                cache_keep_size = 0
+                padding_length = length
+                offset = None
+            else:
+                cache_len = self.streaming_cfg.last_channel_cache_size
+                cache_keep_size = max_audio_length - self.streaming_cfg.cache_drop_size
+                max_audio_length = max_audio_length + cache_len
+                padding_length = length + cache_len
+                offset = torch.neg(cache_last_channel_len) + cache_len
         else:
             padding_length = length
             cache_last_channel_next = None
             cache_len = 0
+            cache_keep_size = 0
             offset = None
 
         audio_signal, pos_emb = self.pos_enc(x=audio_signal, cache_len=cache_len)
@@ -665,9 +682,10 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         )
 
         if cache_last_channel is not None:
-            pad_mask = pad_mask[:, cache_len:]
-            if att_mask is not None:
-                att_mask = att_mask[:, cache_len:]
+            if cache_len > 0:
+                pad_mask = pad_mask[:, cache_len:]
+                if att_mask is not None:
+                    att_mask = att_mask[:, cache_len:]
             # Convert caches from the tensor to list
             cache_last_time_next = []
             cache_last_channel_next = []
@@ -748,12 +766,26 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         if cache_last_channel is not None:
             cache_last_channel_next = torch.stack(cache_last_channel_next, dim=0)
             cache_last_time_next = torch.stack(cache_last_time_next, dim=0)
+            if self.self_attention_model == "mala":
+                if cache_last_channel_len is None:
+                    cache_last_channel_next_len = torch.full(
+                        (audio_signal.size(0),),
+                        self.streaming_cfg.last_channel_cache_size,
+                        device=audio_signal.device,
+                        dtype=torch.int64,
+                    )
+                else:
+                    cache_last_channel_next_len = torch.full_like(
+                        cache_last_channel_len, self.streaming_cfg.last_channel_cache_size
+                    )
+            else:
+                cache_last_channel_next_len = torch.clamp(cache_last_channel_len + cache_keep_size, max=cache_len)
             return (
                 audio_signal,
                 length,
                 cache_last_channel_next,
                 cache_last_time_next,
-                torch.clamp(cache_last_channel_len + cache_keep_size, max=cache_len),
+                cache_last_channel_next_len,
             )
         else:
             return audio_signal, length
@@ -966,7 +998,12 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             streaming_cfg.cache_drop_size = 0
             lookahead_steps = None
 
-        if chunk_size is None:
+        if self.self_attention_model == "mala":
+            if len(self.layers) > 0 and hasattr(self.layers[0].self_attn, "recurrent_cache_size"):
+                streaming_cfg.last_channel_cache_size = self.layers[0].self_attn.recurrent_cache_size
+            else:
+                streaming_cfg.last_channel_cache_size = self.d_model // self.n_heads + 3
+        elif chunk_size is None:
             streaming_cfg.last_channel_cache_size = att_context_size[0] if att_context_size[0] >= 0 else max_context
         else:
             if left_chunks is None:
@@ -1054,6 +1091,19 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
             device=device,
             dtype=dtype,
         )
+        if self.self_attention_model == "mala":
+            cache_last_channel = torch.zeros_like(cache_last_channel)
+            cache_last_channel_len = torch.zeros(batch_size, device=device, dtype=torch.int64)
+            if max_dim > 0:
+                cache_last_time = create_tensor(
+                    (len(self.layers), batch_size, self.d_model, last_time_cache_size),
+                    device=device,
+                    dtype=dtype,
+                )
+            else:
+                cache_last_time = torch.zeros_like(cache_last_time)
+            return cache_last_channel, cache_last_time, cache_last_channel_len
+
         if max_dim > 0:
             cache_last_channel_len = torch.randint(
                 0,
@@ -1093,6 +1143,9 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
 
                 'abs_pos':
                     absolute positional embedding and Transformer
+
+                'mala':
+                    magnitude-aware linear attention with LePE positional encoding
 
                 If None is provided, the self_attention_model isn't changed. Defaults to None.
             att_context_size (List[int]): List of 2 ints corresponding to left and right attention context sizes,
@@ -1138,6 +1191,13 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                 max_len=self._cfg.pos_emb_max_len,
                 xscale=self.xscale,
             )
+        elif self_attention_model == "mala":
+            new_pos_enc = PositionalEncoding(
+                d_model=self._cfg.d_model,
+                dropout_rate=self._cfg.dropout,
+                max_len=self._cfg.pos_emb_max_len,
+                xscale=self.xscale,
+            )
         else:
             raise ValueError(f"Not valid self_attention_model: '{self_attention_model}'!")
 
@@ -1148,6 +1208,7 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
         self.self_attention_model = self_attention_model
         self.att_context_size = att_context_size
         self.set_max_audio_length(self.pos_emb_max_len)
+        self.setup_streaming_params()
 
         for _, m in self.named_modules():
             if type(m) == ConformerLayer:
@@ -1183,10 +1244,17 @@ class ConformerEncoder(NeuralModule, StreamingEncoder, Exportable, AccessMixin):
                         use_pytorch_sdpa=self.use_pytorch_sdpa,
                         use_pytorch_sdpa_backends=self.use_pytorch_sdpa_backends,
                     )
+                elif self_attention_model == 'mala':
+                    new_attn = MALAMultiHeadAttention(
+                        n_head=self._cfg.n_heads,
+                        n_feat=self._cfg.d_model,
+                        dropout_rate=self._cfg.dropout_att,
+                        max_cache_len=att_context_size[0],
+                    )
                 else:
                     raise ValueError(
                         f"'{self_attention_model}' is not not a valid value for 'self_attention_model', "
-                        f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos']"
+                        f"valid values can be from ['rel_pos', 'rel_pos_local_attn', 'abs_pos', 'mala']"
                     )
                 if device is not None:
                     new_attn = new_attn.to(device=device)
@@ -1362,6 +1430,7 @@ class ConformerChangeConfig:
      'rel_pos_local_attn': relative positional embedding and Transformer-XL with local attention using
       overlapping chunks. Attention context is determined by att_context_size parameter.
      'abs_pos': absolute positional embedding and Transformer
+     'mala': magnitude-aware linear attention with LePE positional encoding
     """
 
     # If None is provided, self_attention_model is not changed.

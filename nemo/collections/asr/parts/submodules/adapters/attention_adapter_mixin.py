@@ -85,7 +85,7 @@ class AttentionAdapterModuleMixin(adapter_mixins.AdapterModuleMixin):
         if not hasattr(self, 'self_attention_model'):
             raise RuntimeError(
                 "self_attention_model attribute not found in the module! Please set in the module "
-                "a string attribute 'self_attention_model' with value 'abs_pos', 'rel_pos' or "
+                "a string attribute 'self_attention_model' with value 'abs_pos', 'rel_pos', 'mala' or "
                 "other supported self-attention model types."
             )
 
@@ -109,7 +109,7 @@ class AttentionAdapterModuleMixin(adapter_mixins.AdapterModuleMixin):
                 x = dict(query=x, key=x, value=x, mask=att_mask, pos_emb=pos_emb)
                 output = adapter_strategy(x, adapter_module, module=self)
 
-            elif self.self_attention_model == 'abs_pos':
+            elif self.self_attention_model in ['abs_pos', 'mala']:
                 x = dict(query=x, key=x, value=x, mask=att_mask)
                 output = adapter_strategy(x, adapter_module, module=self)
 
